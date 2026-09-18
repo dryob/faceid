@@ -10,26 +10,81 @@ abgetastet (clip_fallback) — das ist der haeufigste Fall, nicht die Ausnahme.
 """
 import json
 import logging
+import math
+import copy
 import queue
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import paho.mqtt.client as mqtt
 import requests
 
 from .engine import FaceEngine, crop_face, reject_reason
 from .hires import find_face_in_clip, upgrade_face
+from .nas_io import atomic_write_text_pinned, mkdir_pinned
 
 log = logging.getLogger("faceid.mqtt")
 
 
-class EventProcessor:
-    # Wird in main() gesetzt, sobald der Ordner-Eingang gebaut ist. Als Klassenvorgabe da,
-    # damit kein Leser den Zeitraum zwischen start() und der Zuweisung abfangen muss.
-    folder_ingest = None
+def anonymous_ha_payload(anonymous_person_uuid: str, camera: str,
+                         last_seen: float) -> dict:
+    """Build the privacy-minimal HA event contract for anonymous people."""
+    if not anonymous_person_uuid or not camera:
+        raise ValueError("anonymous UUID and camera are required")
+    return {"anonymous_person_uuid": anonymous_person_uuid,
+            "camera": camera, "last_seen": float(last_seen)}
 
-    def __init__(self, cfg: dict, engine, gallery, frigate):
+
+class HomeAssistantMqttPublisher:
+    """Publish the privacy-minimal event through HA's MQTT integration.
+
+    Z13's local broker is intentionally isolated from Home Assistant.  The
+    REST service call lets HA publish to its already-authorised Mosquitto
+    integration without copying broker credentials into the FaceID process.
+    """
+
+    def __init__(self, cfg: dict):
+        f = cfg.get("faceid", {})
+        self.url = str(f.get("ha_rest_url", "")).rstrip("/")
+        self.topic = str(f.get("ha_event_topic", "faceid/event")).strip("/")
+        token_file = str(f.get("ha_token_file", ""))
+        self.token = ""
+        if self.url and token_file:
+            try:
+                self.token = open(token_file, encoding="utf-8").read().strip()
+            except OSError:
+                log.warning("Home Assistant token file unavailable; HA publisher disabled")
+        self.enabled = bool(self.url and self.topic and self.token)
+        self.verify_tls = bool(f.get("ha_verify_tls", True))
+        self.timeout = float(f.get("ha_timeout_seconds", 8))
+
+    def publish_topic(self, topic: str, payload, *, retain: bool = False,
+                      qos: int = 1) -> bool:
+        if not self.enabled:
+            return True
+        response = requests.post(
+            f"{self.url}/api/services/mqtt/publish",
+            headers={"Authorization": f"Bearer {self.token}",
+                     "Content-Type": "application/json"},
+            json={"topic": topic,
+                  "payload": (json.dumps(payload, ensure_ascii=False)
+                              if isinstance(payload, (dict, list)) else str(payload)),
+                  "qos": qos, "retain": retain},
+            timeout=self.timeout,
+            verify=self.verify_tls,
+        )
+        response.raise_for_status()
+        return True
+
+    def publish(self, payload: dict) -> None:
+        self.publish_topic(self.topic, payload)
+
+
+class EventProcessor:
+    def __init__(self, cfg: dict, engine, gallery, frigate, state_path=None,
+                 storage_guard=None):
         self.cfg = cfg
         self.engine = engine
         self.gallery = gallery
@@ -38,8 +93,7 @@ class EventProcessor:
         self.events: dict[str, dict] = {}  # event_id -> Zustand
         self.recent = deque(maxlen=100)  # Ringpuffer für die UI
         self.client: mqtt.Client | None = None
-        self.frigate_enabled = bool(getattr(frigate, "enabled", True))
-        self.mqtt_enabled = bool((cfg.get("mqtt") or {}).get("enabled", True))
+        self.ha_publisher = HomeAssistantMqttPublisher(cfg)
         f = cfg["faceid"]
         self.match_thr = float(f.get("match_threshold", 0.5))
         self.unknown_thr = float(f.get("unknown_threshold", 0.35))
@@ -49,6 +103,17 @@ class EventProcessor:
         self.cameras = set(f.get("cameras") or [])
         self.set_sub_label = bool(f.get("set_sub_label", True))
         self.presence_window = float(f.get("presence_window", 120))
+        self.recent_face_window = float(f.get("recent_face_window", 300))
+        # A separate HA heartbeat lets native Template Helpers distinguish a
+        # healthy running producer from retained last_seen data after a crash.
+        # Keep the existing status topic as ``online`` for MQTT availability;
+        # heartbeat uses its own topic and carries only an opaque timestamp.
+        prefix = str(f.get("mqtt_prefix", "faceid")).strip("/") or "faceid"
+        self.health_topic = str(f.get("ha_health_topic", f"{prefix}/health")).strip("/")
+        self.health_heartbeat_seconds = max(
+            15.0, float(f.get("ha_health_heartbeat_seconds", 30))
+        )
+        self._last_health_heartbeat = 0.0
         self.ignore_thr = float(f.get("ignore_threshold", f.get("match_threshold", 0.5)))
         self.ignore_learning = bool(f.get("ignore_learning", True))
         self.hires_enroll = bool(f.get("hires_enroll", True))
@@ -100,51 +165,238 @@ class EventProcessor:
         # Gedaechtnis haelt der Poller ein fertig verarbeitetes Ereignis fuer neu.
         self._handled: deque = deque(maxlen=1000)
         self.prefix = str(f.get("mqtt_prefix", "faceid")).strip("/") or "faceid"
-        self.present: dict[str, dict[str, float]] = {}  # camera -> {person: zuletzt gesehen}
+        # Only opaque anonymous UUIDs are eligible for HA state.  Known display
+        # names, scores, event IDs and zones remain local to this process/UI.
+        self.present: dict[str, dict[str, float]] = {}  # camera -> {opaque UUID: last seen}
+        # Keep the five-minute recent-face window independent from the shorter
+        # presence window.  A person can leave the presence state at 120s while
+        # the camera must still report a face seen within the last 300s.
+        self.recent_seen: dict[str, dict[str, float]] = {}
         self._last_presence: dict[str, list] = {}  # zuletzt publizierter Stand je Kamera
+        self._last_recent: dict[str, bool] = {}
         # letzte Meldung je Kamera, damit sie im Attribut stehen bleibt: der Finalizer
         # schreibt den Anwesenheitsstand alle paar Sekunden neu, und ohne diesen Merker
         # verschwand die letzte Erkennung, sobald das Anwesenheitsfenster ablief.
         self._last_event: dict[str, dict] = {}
         # Verlauf der Meldungen; wird vom Dienst gesetzt (None = nicht mitschreiben)
         self.history = None
+        self._observation_keys: set[str] = set()
+        self._last_label_mapping: list[dict] | None = None
+        # This is the durable, privacy-minimal aggregate used by the HA overview.
+        # It is keyed by the stable anonymous UUID, not by the latest camera event;
+        # therefore a second camera or an out-of-order event cannot erase a person's
+        # newest valid observation.  The main process places this file under its
+        # already guarded data directory (tests may provide a temporary path).
+        configured_state = self.cfg.get("faceid", {}).get("last_seen_state_file")
+        self.last_seen_path = Path(state_path or configured_state) if (state_path or configured_state) else None
+        self.storage_guard = storage_guard
+        self.last_seen_by_person: dict[str, dict] = {}
+        self._load_last_seen()
+
+    def _presence_is_healthy(self) -> bool:
+        """Return whether the producer has a live MQTT connection."""
+        return self.client is not None and self.client.is_connected()
+
+    def _load_last_seen(self):
+        if self.last_seen_path is None:
+            return
+        try:
+            raw = json.loads(self.last_seen_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        for uuid, value in (raw.get("people") or {}).items() if isinstance(raw, dict) else ():
+            if not isinstance(uuid, str) or not isinstance(value, dict):
+                continue
+            cameras = {}
+            for camera, timestamp in (value.get("cameras") or {}).items():
+                try:
+                    timestamp = float(timestamp)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(timestamp):
+                    cameras[str(camera)] = timestamp
+            try:
+                last_seen = float(value.get("last_seen"))
+            except (TypeError, ValueError):
+                last_seen = None
+            candidates = list(cameras.values())
+            if last_seen is not None and math.isfinite(last_seen):
+                candidates.append(last_seen)
+            if candidates:
+                self.last_seen_by_person[uuid] = {
+                    "last_seen": max(candidates), "cameras": cameras,
+                }
+
+    def _save_last_seen(self):
+        if self.last_seen_path is None:
+            return
+        payload = {"version": 1, "people": self.last_seen_by_person}
+        temporary = self.last_seen_path.with_name(self.last_seen_path.name + ".tmp")
+        # The aggregate is durable FaceID data.  Route both directory creation
+        # and the atomic replacement through the same mount-pinned guard used by
+        # gallery/history; never fall back to a local path after NAS loss.
+        try:
+            mkdir_pinned(self.last_seen_path.parent, self.storage_guard)
+            atomic_write_text_pinned(
+                self.last_seen_path,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                self.storage_guard,
+            )
+        except Exception:
+            log.exception("could not persist aggregate FaceID last_seen state")
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    def _record_observation(self, anonymous_person_uuid: str, camera: str,
+                            observed_at: float) -> bool:
+        """Keep the maximum valid observation for a UUID across all cameras."""
+        if not anonymous_person_uuid or not camera:
+            return False
+        # Do not let diagnostic/probe topics become durable person history.
+        # In production ``self.cameras`` is the explicit camera allowlist;
+        # an empty list retains the legacy meaning of accepting Frigate cameras.
+        if camera.startswith("_ops_probe") or (
+                self.cameras and camera not in self.cameras):
+            return False
+        try:
+            observed_at = float(observed_at)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(observed_at):
+            return False
+        snapshot = copy.deepcopy(self.last_seen_by_person)
+        record = self.last_seen_by_person.setdefault(
+            anonymous_person_uuid, {"last_seen": observed_at, "cameras": {}})
+        cameras = record.setdefault("cameras", {})
+        if observed_at <= float(cameras.get(camera, float("-inf"))):
+            return False
+        cameras[camera] = observed_at
+        previous = float(record.get("last_seen", float("-inf")))
+        record["last_seen"] = max(previous, observed_at)
+        try:
+            self._save_last_seen()
+        except Exception:
+            # A rejected/failed durable write must not leave memory claiming a
+            # state that will disappear on restart.  The next valid observation
+            # can retry from the prior committed snapshot.
+            self.last_seen_by_person = snapshot
+            raise
+        return True
+
+    def _display_alias(self, label: str) -> str:
+        aliases = self.cfg.get("faceid", {}).get("ha_display_aliases") or {}
+        return str(aliases.get(label, label))
+
+    def _label_mapping(self) -> list[dict]:
+        """Read the current UI gallery labels and map them to opaque UUIDs."""
+        try:
+            persons = self.gallery.persons()
+        except (AttributeError, TypeError):
+            return []
+        result = []
+        for entry in sorted(persons.values(), key=lambda value: value["name"].casefold()):
+            uuid = entry.get("person_uuid")
+            if not uuid:
+                continue
+            person = {"label": entry["name"],
+                      "alias": self._display_alias(entry["name"]),
+                      "anonymous_person_uuid": uuid}
+            last_seen = self.last_seen_by_person.get(uuid, {}).get("last_seen")
+            if last_seen is not None:
+                person["last_seen"] = last_seen
+            result.append(person)
+        return result
+
+    def _publish_label_mapping(self) -> bool:
+        """Publish the live UI-label/UUID mapping, without biometric payloads."""
+        mapping = self._label_mapping()
+        if mapping == self._last_label_mapping:
+            return True
+        conf = {
+            "name": "FaceID UI label mapping",
+            "unique_id": f"{self.prefix}_ui_label_mapping",
+            "object_id": f"{self.prefix}_ui_label_mapping",
+            "state_topic": f"{self.prefix}/label_mapping/state",
+            "json_attributes_topic": f"{self.prefix}/label_mapping/state",
+            "value_template": "{{ value_json.count }}",
+            "unit_of_measurement": "labels",
+            "icon": "mdi:account-details",
+            "device": {"identifiers": [self.prefix], "name": "FaceID"},
+        }
+        if not self._publish_ha_topic(
+                f"homeassistant/sensor/{self.prefix}_label_mapping/config", conf, retain=True):
+            return False
+        if not self._publish_ha_topic(
+                f"{self.prefix}/label_mapping/state",
+                {"count": len(mapping), "people": mapping}, retain=True):
+            return False
+        for person in mapping:
+            person_id = person["anonymous_person_uuid"].replace("-", "_")
+            person_conf = {
+                "name": person["alias"],
+                "unique_id": f"{self.prefix}_label_{person_id}",
+                "object_id": f"{self.prefix}_label_{person_id}",
+                "state_topic": f"{self.prefix}/label_mapping/{person_id}",
+                "value_template": "{{ value_json.anonymous_person_uuid }}",
+                "json_attributes_topic": f"{self.prefix}/label_mapping/{person_id}",
+                "icon": "mdi:account-badge",
+                "device": {"identifiers": [self.prefix], "name": "FaceID"},
+            }
+            if not self._publish_ha_topic(
+                    f"homeassistant/sensor/{self.prefix}_label_{person_id}/config",
+                    person_conf, retain=True):
+                return False
+            if not self._publish_ha_topic(
+                    f"{self.prefix}/label_mapping/{person_id}", person, retain=True):
+                return False
+        # Update the cache only after every retained HA publish succeeded.  A
+        # transient HA failure must be retried by the next finalizer cycle.
+        self._last_label_mapping = mapping
+        return True
+
+    def _publish_ha_topic(self, topic: str, payload, *, retain: bool = False) -> bool:
+        """Keep HA REST failures from stopping the local MQTT pipeline."""
+        try:
+            # Treat legacy/test doubles returning None as successful.  The real
+            # publisher returns False only for an explicitly disabled transport
+            # (which is handled as success above) or raises on a failed request.
+            return self.ha_publisher.publish_topic(topic, payload, retain=retain) is not False
+        except Exception:
+            log.exception("could not publish HA MQTT topic %s", topic)
+            return False
 
     # ---------- MQTT ----------
 
     def start(self):
-        if self.mqtt_enabled:
-            m = self.cfg["mqtt"]
-            c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.prefix)
-            self.client = c
-            if m.get("user"):
-                c.username_pw_set(m["user"], m.get("password", ""))
-            c.will_set(f"{self.prefix}/status", "offline", retain=True)
-            c.on_connect = self._on_connect
-            c.on_message = self._on_message
-            c.connect(m["host"], int(m.get("port", 1883)), keepalive=60)
-            c.loop_start()
-        else:
-            log.info("MQTT publishing disabled")
-        if self.frigate_enabled:
-            self._check_frigate()
-            threading.Thread(target=self._worker, daemon=True, name="faceid-worker").start()
+        m = self.cfg["mqtt"]
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.prefix)
+        self.client = c
+        if m.get("user"):
+            c.username_pw_set(m["user"], m.get("password", ""))
+        c.will_set(f"{self.prefix}/status", "offline", retain=True)
+        c.on_connect = self._on_connect
+        c.on_message = self._on_message
+        c.connect(m["host"], int(m.get("port", 1883)), keepalive=60)
+        c.loop_start()
+        self._check_frigate()
+        threading.Thread(target=self._worker, daemon=True, name="faceid-worker").start()
         threading.Thread(target=self._finalizer, daemon=True, name="faceid-finalizer").start()
         # Eigener Thread: ein Clip-Scan dauert Sekunden, im Finalizer wuerde er die
         # Anwesenheits-Aktualisierung blockieren, im Worker die naechsten Snapshots.
         # Laeuft unabhaengig von clip_fallback, damit die Option in den Einstellungen
         # sofort greift statt erst nach einem Neustart — er wartet dann nur an der Queue.
-        if self.frigate_enabled:
-            threading.Thread(target=self._clip_worker, daemon=True, name="faceid-clip").start()
-            # Einschraenkungen sichtbar machen: sonst sucht man spaeter im Log vergeblich
-            # nach Aufnahme-Scans, die per Konfiguration gar nicht stattfinden sollen.
-            if not self.clip_fallback:
-                log.info("Recording fallback is off — events whose snapshot has no face are dropped")
-            elif self.clip_fallback_cameras:
-                log.info("Recording fallback limited to: %s",
-                         ", ".join(sorted(self.clip_fallback_cameras)))
-            self._check_go2rtc()
-        else:
-            log.info("Frigate input disabled; waiting for folder media")
+        threading.Thread(target=self._clip_worker, daemon=True, name="faceid-clip").start()
+        # Einschraenkungen sichtbar machen: sonst sucht man spaeter im Log vergeblich
+        # nach Aufnahme-Scans, die per Konfiguration gar nicht stattfinden sollen.
+        if not self.clip_fallback:
+            log.info("Recording fallback is off — events whose snapshot has no face are dropped")
+        elif self.clip_fallback_cameras:
+            log.info("Recording fallback limited to: %s",
+                     ", ".join(sorted(self.clip_fallback_cameras)))
+        self._check_go2rtc()
 
     def _check_go2rtc(self):
         """Einmal beim Start pruefen, ob der Live-Rueckgriff moeglich waere.
@@ -197,13 +449,12 @@ class EventProcessor:
         # still, ohne weitere Meldung. Genau so trat Issue #11 auf. Deshalb faengt jeder
         # Callback hier ab und protokolliert, statt die Verbindung mitzureissen.
         try:
-            if self.frigate_enabled:
-                log.info("MQTT connected (%s), subscribing to %s/events", reason_code, self.frigate_topic)
-                client.subscribe(f"{self.frigate_topic}/events")
-            else:
-                log.info("MQTT connected (%s), folder input mode", reason_code)
+            log.info("MQTT connected (%s), subscribing to %s/events", reason_code, self.frigate_topic)
+            client.subscribe(f"{self.frigate_topic}/events")
             client.publish(f"{self.prefix}/status", "online", retain=True)
+            self._publish_ha_topic(f"{self.prefix}/status", "online", retain=True)
             self._publish_discovery()
+            self._publish_health_heartbeat(force=True)
         except Exception:
             log.exception("error in the MQTT connect callback — connection kept alive")
 
@@ -236,7 +487,9 @@ class EventProcessor:
             {"camera": cam, "attempts": 0, "best_score": 0.0, "best_person": None,
              "best_unknown": None, "last_try": 0.0, "done": False, "ended": False,
              "created": time.time(), "zones": [],
-             "start_time": after.get("start_time") or time.time(), "end_time": None},
+             "start_time": after.get("start_time") or time.time(),
+             "observation_time": after.get("start_time") or time.time(),
+             "end_time": None},
         )
         # Zonen aus jedem Update mitschreiben: beim Veroeffentlichen liegt der
         # Frigate-Payload laengst nicht mehr vor. `entered_zones` ist kumulativ und
@@ -381,7 +634,6 @@ class EventProcessor:
             # Gesicht steht auf der Ignore-Liste: nicht melden, nicht taggen, nicht vorlegen
             st["best_unknown"] = None
             st["done"] = True
-            st["ignored"] = True
             # Anker-Lernen nur bei eindeutigen Fällen: klarer Ignore-Match UND deutlicher
             # Abstand zum besten Personen-Match — so wird nie ein Familienmitglied still
             # zum Negativ-Anker. Nur neue Erscheinungsformen werden gespeichert.
@@ -401,14 +653,19 @@ class EventProcessor:
                  st["attempts"], name, score, via, verdict)
 
         if slug and score >= self.match_thr:
+            anonymous_person_uuid = self.gallery.person_uuid(slug)
             if not primary:
                 # Nur melden und zur Anwesenheit zaehlen; kein sub_label, kein best_score.
-                self._publish_recognition(eid, st, name, score, crop=crop, emb=emb)
+                self._publish_recognition(eid, st, name, score, crop=crop, emb=emb,
+                                          anonymous_person_uuid=anonymous_person_uuid)
+                self.gallery.touch_person(slug, seen_ts=st.get("start_time") or time.time())
                 return
             if score > st["best_score"]:
                 st["best_score"], st["best_person"] = score, name
-                self._publish_recognition(eid, st, name, score, crop=crop, emb=emb)
-                if self.set_sub_label and not st.get("local_media"):
+                self._publish_recognition(eid, st, name, score, crop=crop, emb=emb,
+                                          anonymous_person_uuid=anonymous_person_uuid)
+                self.gallery.touch_person(slug, seen_ts=st.get("start_time") or time.time())
+                if self.set_sub_label:
                     self.frigate.set_sub_label(eid, name, score)
             if score >= self.match_thr + 0.1:
                 st["done"] = True  # sehr sicherer Treffer -> keine weiteren Versuche
@@ -425,45 +682,6 @@ class EventProcessor:
                                       # aus der Aufnahme ist bereits das schaerfste Bild —
                                       # ein zweiter Durchgang durch hires waere derselbe Clip
                                       "from_clip": source != "snapshot"}
-
-    def process_local_face(self, eid: str, camera: str, event_ts: float, img, face,
-                           media_path: str) -> dict:
-        """Run one face found in a completed local media file through the normal policy.
-
-        Each distinct face in the file receives its own synthetic event, matching the
-        one-person-per-event assumption of the Frigate path. This preserves notification,
-        history, ignore and review-queue behavior without pretending the file is a
-        Frigate event.
-        """
-        self._ensure_discovery(camera)
-        st = {
-            "camera": camera, "attempts": 1, "best_score": 0.0,
-            "best_person": None, "best_unknown": None, "last_try": time.time(),
-            "done": False, "ended": True, "created": time.time(), "zones": [],
-            "start_time": event_ts, "end_time": event_ts, "local_media": True,
-            "media_path": media_path,
-        }
-        self._handle_face(eid, st, img, face, source="folder recording")
-        uid = None
-        if st["best_person"] is None and st["best_unknown"] is not None:
-            u = st["best_unknown"]
-            uid = self.gallery.save_unknown(
-                u["crop"], u["emb"],
-                {"camera": camera, "event_id": eid, "event_ts": event_ts,
-                 "media_path": media_path, "guess": u["guess"],
-                 "guess_score": round(u["guess_score"], 3)},
-                full_bgr=u.get("full"),
-            )
-            self._publish_recognition(eid, st, "unknown", u["guess_score"],
-                                      crop=u["crop"], emb=u["emb"])
-            log.info("folder event %s: unknown face stored (%s)", eid, uid or "deduplicated")
-        return {
-            "event_id": eid,
-            "person": st["best_person"] or ("ignored" if st.get("ignored") else "unknown"),
-            "score": round(float(st.get("best_score") or
-                                 (st.get("best_unknown") or {}).get("guess_score", 0.0)), 3),
-            "unknown_id": uid,
-        }
 
     def _poller(self):
         """Frigate-Ereignisse abfragen, die per MQTT nie ankommen.
@@ -510,6 +728,7 @@ class EventProcessor:
                     # hier sogar vollstaendig: das Ereignis ist abgeschlossen
                     "zones": list(ev.get("zones") or []),
                     "start_time": ev.get("start_time") or time.time(),
+                    "observation_time": ev.get("start_time") or time.time(),
                     "end_time": ev.get("end_time"),
                 }
                 log.info("poll: picked up event %s (%s) — never announced over MQTT",
@@ -550,7 +769,8 @@ class EventProcessor:
         hit = find_face_in_clip(self.engine, self.frigate, eid,
                                 max_frames=self.clip_frames,
                                 min_px=self.min_face_px,
-                                min_det=self.clip_min_det, stats=stats)
+                                min_det=self.clip_min_det, stats=stats,
+                                storage_guard=self.gallery.storage_guard)
         took = time.time() - t0
         if hit is None and not stats.get("frames"):
             # Kein einziger Frame gelesen: Frigate stellt den Clip erst nach dem
@@ -584,8 +804,10 @@ class EventProcessor:
         while True:
             time.sleep(5)
             now = time.time()
+            self._publish_health_heartbeat(now=now)
             for cam in list(self.present.keys()):
                 self._publish_presence(cam)  # abgelaufene Personen austragen -> ggf. 'niemand'
+            self._publish_label_mapping()
             for eid in list(self.events.keys()):
                 st = self.events[eid]
                 expired = now - st["created"] > 600
@@ -620,7 +842,8 @@ class EventProcessor:
                         try:
                             hi = upgrade_face(self.engine, self.frigate, st["camera"],
                                               st.get("start_time"), st.get("end_time"), emb,
-                                              event_id=eid)
+                                              event_id=eid,
+                                              storage_guard=self.gallery.storage_guard)
                         except Exception:
                             hi = None
                         if hi is not None:
@@ -635,31 +858,40 @@ class EventProcessor:
                         crop, emb,
                         {"camera": st["camera"], "event_id": eid,
                          "event_ts": st.get("start_time"),
+                         "observation_key": f"{eid}:unknown",
                          "guess": u["guess"], "guess_score": round(u["guess_score"], 3)},
-                        full_bgr=full,
+                        full_bgr=None,
                     )
                     # crop/emb statt u[...]: kommt der schaerfere Ausschnitt aus der
                     # Aufnahme, ist genau der auch der gemeldete.
+                    anonymous_uuid = None
+                    if uid is not None:
+                        self.gallery.unknown_clusters()
+                        anonymous_uuid = self.gallery.anonymous_person_uuid(uid)
                     self._publish_recognition(eid, st, "unknown", u["guess_score"],
-                                              crop=crop, emb=emb)
+                                              crop=crop, emb=emb,
+                                              anonymous_person_uuid=anonymous_uuid)
                     log.info("event %s: unknown face stored (%s)", eid, uid)
                 self.events.pop(eid, None)
 
     # ---------- Publish ----------
 
     def _publish_recognition(self, eid: str, st: dict, name: str, score: float,
-                             crop=None, emb=None):
+                             crop=None, emb=None, anonymous_person_uuid=None):
+        observed_at = self._observation_time(st)
         payload = {
             "person": name, "score": round(float(score), 3), "camera": st["camera"],
-            "event_id": eid, "ts": time.time(),
+            "event_id": eid, "ts": observed_at,
             # Frigate-Zonen, die die Person in diesem Ereignis betreten hat. Leer, wenn
             # die Kamera keine Zonen hat ODER Frigate die Person keiner zugeordnet hat —
             # beides sieht gleich aus, deshalb in Automationen nie auf "leer heisst
             # ausserhalb" bauen.
             "zones": list(st.get("zones") or []),
         }
-        if st.get("media_path"):
-            payload["media_file"] = str(st["media_path"]).rsplit("/", 1)[-1]
+        # Every HA identity path is fail-closed.  A known display name is not a
+        # permitted substitute for an anonymous UUID.
+        ha_payload = (anonymous_ha_payload(anonymous_person_uuid, st["camera"], observed_at)
+                      if anonymous_person_uuid else None)
         self.recent.appendleft(payload)
         # faceid/event genau einmal pro (Event, Person) — Score-Verbesserungen lösen keine
         # erneute Meldung aus (sonst mehrere Notifications für dieselbe Sichtung).
@@ -673,6 +905,7 @@ class EventProcessor:
         # kein spaeterer Treffer koennte die Meldung nachholen. Der Verlauf fuehrt seine
         # eigene Merkliste (hids, s. unten).
         announced = st.setdefault("announced", set())
+        ha_announced = st.setdefault("ha_announced", set())
         sent = False
         if self.client is not None and name not in announced:
             # is_connected() zusaetzlich zum rc: MQTT_ERR_SUCCESS heisst nur "in den
@@ -686,8 +919,12 @@ class EventProcessor:
             # Benachrichtigung ist schlimmer als eine Zeile ohne Marke.
             if self.client.is_connected():
                 try:
-                    info = self.client.publish(f"{self.prefix}/event",
-                                               json.dumps(payload, ensure_ascii=False))
+                    if ha_payload is None:
+                        info, rc = None, mqtt.MQTT_ERR_NO_CONN
+                    else:
+                        info = self.client.publish(f"{self.prefix}/event",
+                                                   json.dumps(ha_payload, ensure_ascii=False))
+                        rc = getattr(info, "rc", None)
                 except Exception:
                     # paho wirft durchaus (etwa ValueError bei zu grosser Nachricht).
                     # Ungefangen risse das die ganze Erkennung mit — Sensor, Verlauf und
@@ -699,7 +936,7 @@ class EventProcessor:
                     # unten als "vielleicht verschickt" und sperrte die Wiederholung.
                     info, rc = None, mqtt.MQTT_ERR_NO_CONN
                 else:
-                    rc = getattr(info, "rc", None)
+                    rc = locals().get("rc", mqtt.MQTT_ERR_NO_CONN)
                 # Zwei verschiedene Fragen, deshalb zwei Merker:
                 #
                 # ``announced`` verhindert die Doppelmeldung. Eingereiht ist verschickt —
@@ -719,13 +956,33 @@ class EventProcessor:
                     # steht der Name auch bei bloss eingereiht (MQTT_ERR_AGAIN) oder bei
                     # unerwartetem Rueckgabewert. Fuer die Verlaufsmarke reicht das nicht.
                     st.setdefault("reported_names", set()).add(name)
+        if ha_payload is not None and name not in ha_announced:
+            try:
+                self.ha_publisher.publish(ha_payload)
+            except Exception:
+                log.exception("could not publish the anonymous event to Home Assistant")
+            else:
+                ha_announced.add(name)
         # "unknown" gehoert NICHT in die Anwesenheitsliste. Der Sensor-State ist eine
         # Aufzaehlung von Namen ("Christian, Juli"), und ein hineingemischtes "unknown"
         # liest sich wie ein weiterer Name — auf dem Handy stand "Christian unknown ist
         # da". Fremde meldet ausschliesslich das Event-Topic; der Sensor sagt, WER da ist.
-        if name != "unknown":
-            self.present.setdefault(st["camera"], {})[name] = time.time()
-        self._publish_presence(st["camera"], last=payload)
+        if anonymous_person_uuid:
+            # Only advance the live camera topics when the durable aggregate
+            # accepted this observation.  Replayed/out-of-order events must not
+            # re-light an expired presence sensor or overwrite a newer retained
+            # camera observation after a restart.
+            recorded = self._record_observation(
+                anonymous_person_uuid, st["camera"], observed_at
+            )
+            if recorded:
+                self.present.setdefault(st["camera"], {})[anonymous_person_uuid] = observed_at
+                self.recent_seen.setdefault(st["camera"], {})[anonymous_person_uuid] = observed_at
+                self._publish_presence(st["camera"], last=ha_payload)
+            # The mapping sensor is the live, authorized UI-label surface used by
+            # the overview.  Refresh it after each valid observation so its
+            # per-person last_seen is the cross-camera maximum, not a startup time.
+            self._publish_label_mapping()
         # Den TATSAECHLICH benutzten Ausschnitt festhalten. Der Frigate-Snapshot wird
         # waehrend des Ereignisses fortlaufend ersetzt und zeigt spaeter oft einen anderen
         # Moment — eine Nachpruefung an ihm fuehrt in die Irre. Siehe app/history.py.
@@ -781,34 +1038,74 @@ class EventProcessor:
                 if hid is not None and name != "unknown":
                     hids[name] = hid
 
+    @staticmethod
+    def _observation_time(st: dict) -> float:
+        """Return the source event timestamp, not the delayed processing time."""
+        for key in ("observation_time", "start_time"):
+            value = st.get(key)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value >= 0:
+                return value
+        return time.time()
+
     def _publish_presence(self, cam: str, last: dict | None = None):
         """Sensor-State = alle im Fenster gesehenen Personen ('Christian, Juli' / 'niemand')."""
         now = time.time()
+        if not self._presence_is_healthy():
+            # Never publish a presence assertion based solely on retained,
+            # restart-restored last_seen data while the producer is offline.
+            self._last_presence[cam] = []
+            self._last_recent[cam] = False
+            self._publish_ha_topic(f"{self.prefix}/{cam}/recent", "OFF", retain=True)
+            return
         pres = self.present.setdefault(cam, {})
         for n, ts in list(pres.items()):
             if now - ts > self.presence_window:
                 pres.pop(n)
-        names = [n for n, _ in sorted(pres.items(), key=lambda kv: -kv[1])]
+        recent_seen = self.recent_seen.setdefault(cam, {})
+        for n, ts in list(recent_seen.items()):
+            if now - ts > self.recent_face_window:
+                recent_seen.pop(n)
+        uuids = [n for n, _ in sorted(pres.items(), key=lambda kv: -kv[1])]
+        recent = bool(recent_seen)
         if last:
             self._last_event[cam] = last
-        if names == self._last_presence.get(cam) and last is None:
+        if (uuids == self._last_presence.get(cam)
+                and recent == self._last_recent.get(cam)
+                and last is None):
             return  # nichts geändert -> retained Topic nicht neu beschreiben
-        self._last_presence[cam] = names
-        if self.client:
-            attrs = {"persons": names, "window_s": self.presence_window, "ts": now}
-            # 'last' bleibt erhalten, auch wenn niemand mehr anwesend ist — es beantwortet
-            # "wer wurde hier zuletzt erkannt?", und das wird nicht falsch, nur weil die
-            # Person gegangen ist. Nach einem Neustart erst wieder ab der ersten Erkennung.
-            seen = self._last_event.get(cam)
-            if seen:
-                attrs["last"] = seen
-            self.client.publish(f"{self.prefix}/{cam}/person", ", ".join(names) or "nobody", retain=True)
-            self.client.publish(f"{self.prefix}/{cam}/attributes", json.dumps(attrs, ensure_ascii=False), retain=True)
+        self._last_presence[cam] = uuids
+        self._last_recent[cam] = recent
+        if self.client and last:
+            # HA's sensor state and attributes use the same four-field allowlist;
+            # no presence list, score, source event or display name is emitted.
+            self.client.publish(f"{self.prefix}/{cam}/person",
+                                json.dumps(last, ensure_ascii=False), retain=True)
+            self.client.publish(f"{self.prefix}/{cam}/attributes",
+                                json.dumps(last, ensure_ascii=False), retain=True)
+        if last:
+            self._publish_ha_topic(f"{self.prefix}/{cam}/person", last, retain=True)
+            self._publish_ha_topic(f"{self.prefix}/{cam}/attributes", last, retain=True)
+        self._publish_ha_topic(f"{self.prefix}/{cam}/recent",
+                               "ON" if recent else "OFF", retain=True)
+
+    def _publish_health_heartbeat(self, *, now: float | None = None,
+                                  force: bool = False) -> bool:
+        """Publish producer health separately from MQTT availability status."""
+        now = time.time() if now is None else float(now)
+        if not force and now - self._last_health_heartbeat < self.health_heartbeat_seconds:
+            return True
+        payload = {"heartbeat": now, "status": "online"}
+        if not self._publish_ha_topic(self.health_topic, payload, retain=True):
+            return False
+        self._last_health_heartbeat = now
+        return True
 
     def _frigate_cameras(self) -> set:
         """Kameranamen von Frigate holen — fuer den Fall, dass keine konfiguriert sind."""
-        if not self.frigate_enabled:
-            return set()
         try:
             conf = self.frigate.config()
             if conf is not None:
@@ -850,6 +1147,8 @@ class EventProcessor:
                 "object_id": f"{self.prefix}_{cam}",
                 "state_topic": f"{self.prefix}/{cam}/person",
                 "json_attributes_topic": f"{self.prefix}/{cam}/attributes",
+                "value_template": "{{ value_json.anonymous_person_uuid }}",
+                "json_attributes_template": "{{ {'anonymous_person_uuid': value_json.anonymous_person_uuid, 'camera': value_json.camera, 'last_seen': value_json.last_seen} | tojson }}",
                 "availability_topic": f"{self.prefix}/status",
                 "icon": "mdi:face-recognition",
                 "device": device,
@@ -857,7 +1156,43 @@ class EventProcessor:
             if self.client:
                 self.client.publish(f"homeassistant/sensor/{self.prefix}_{cam}/config",
                                     json.dumps(conf, ensure_ascii=False), retain=True)
+            self._publish_ha_topic(
+                f"homeassistant/sensor/{self.prefix}_{cam}/config", conf, retain=True)
+            recent_conf = {
+                "name": f"{cam} face recent",
+                "unique_id": f"{self.prefix}_{cam}_face_recent",
+                "object_id": f"{self.prefix}_{cam}_face_recent",
+                "state_topic": f"{self.prefix}/{cam}/recent",
+                "payload_on": "ON", "payload_off": "OFF",
+                "availability_topic": f"{self.prefix}/status",
+                "icon": "mdi:face-recognition",
+                "device": device,
+            }
+            if self.client:
+                self.client.publish(
+                    f"homeassistant/binary_sensor/{self.prefix}_{cam}_face_recent/config",
+                    json.dumps(recent_conf, ensure_ascii=False), retain=True)
+            self._publish_ha_topic(
+                f"homeassistant/binary_sensor/{self.prefix}_{cam}_face_recent/config",
+                recent_conf, retain=True)
             # frischen Anwesenheits-Stand publizieren (räumt auch stale retained States nach Neustart auf)
             self._last_presence.pop(cam, None)
             self.present.setdefault(cam, {})
             self._publish_presence(cam)
+        health_conf = {
+            "name": "producer health",
+            "unique_id": f"{self.prefix}_health",
+            "object_id": f"{self.prefix}_health",
+            "state_topic": self.health_topic,
+            "value_template": "{{ value_json.status }}",
+            "availability_topic": f"{self.prefix}/status",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "icon": "mdi:heart-pulse",
+            "device": device,
+        }
+        self._publish_ha_topic(
+            f"homeassistant/sensor/{self.prefix}_health/config", health_conf,
+            retain=True,
+        )
+        self._publish_label_mapping()
