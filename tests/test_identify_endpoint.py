@@ -261,6 +261,27 @@ def test_identify_accepts_json_base64(tmp_gallery):
     assert body["request"]["content_type"].startswith("application/json")
 
 
+def test_identify_rejects_wrong_field_name_in_multipart(tmp_gallery):
+    """Multipart body whose file field isn't named ``image`` must yield 400.
+
+    FastAPI consumes the request stream to bind the ``image`` parameter even
+    when the caller used a different field name.  Without the ctype guard the
+    else-branch then calls ``await request.body()`` on an already-consumed
+    stream and the handler crashes with ``RuntimeError: Stream consumed``,
+    which surfaces as HTTP 500.  We want a clean 400 with the documented
+    hint, not a 500.
+    """
+    engine = _FakeEngine(faces=[])
+    client = _build_test_app(tmp_gallery, engine)
+    r = client.post(
+        "/api/identify",
+        files={"file": ("p.jpg", _make_fake_image(), "image/jpeg")},
+    )
+    assert r.status_code == 400, r.text
+    detail = r.json().get("detail", "").lower()
+    assert "image" in detail and "field" in detail, detail
+
+
 def test_identify_rejects_garbage_bytes(tmp_gallery):
     engine = _FakeEngine(faces=[])
     client = _build_test_app(tmp_gallery, engine)

@@ -203,10 +203,21 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             raw = await image.read()
             content_type = (image.content_type or "").lower()
         else:
+            # FastAPI may have already consumed the request stream while
+            # trying to bind the ``image`` parameter (e.g. when the caller
+            # used a different multipart field name).  Read the header
+            # *before* touching the body — if the body is a multipart that
+            # omitted ``image``, we can still return a clean 400.  Once
+            # ``await request.body()`` runs on an already-consumed stream,
+            # Starlette raises ``RuntimeError: Stream consumed`` and the
+            # caller gets a misleading 500.
+            ctype = (request.headers.get("content-type") or "").lower()
+            content_type = ctype
+            if "multipart/" in ctype:
+                raise HTTPException(
+                    400, "multipart body must include the 'image' file field")
             body_bytes = await request.body()
             if body_bytes:
-                ctype = (request.headers.get("content-type") or "").lower()
-                content_type = ctype
                 if "application/json" in ctype:
                     try:
                         body = json.loads(body_bytes.decode("utf-8"))
@@ -223,6 +234,9 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
                     except (binascii.Error, ValueError):
                         raise HTTPException(400, "image_base64 is not valid base64")
                 elif "multipart/" in ctype:
+                    # Already guarded above; this branch is unreachable
+                    # but kept for defence in depth — touching ``body``
+                    # after a multipart raise is impossible by design.
                     raise HTTPException(
                         400, "multipart body must include the 'image' file field")
                 else:
