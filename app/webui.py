@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from . import logbuffer
 from .engine import FaceEngine, crop_face, find_face_padded
 from .backup_util import build_backup_gz, write_backup_file, prune_backups
+from .nas_io import atomic_write_text_pinned, atomic_write_bytes_pinned, mkdir_pinned, remove_tree_pinned
 from pathlib import Path as _P
 
 log = logging.getLogger("faceid.web")
@@ -34,17 +35,8 @@ class NameBody(BaseModel):
     name: str
 
 
-def _frigate_url(cfg) -> str:
-    """Basis-URL aus der Konfiguration — leerer String, wenn kein Frigate konfiguriert ist.
-
-    ``url:`` ohne Wert ergibt in YAML ``None``, nicht den fehlenden Schluessel. Ein
-    ``.get("url", "")`` faengt deshalb nur den zweiten Fall ab, und ``None.rstrip("/")``
-    nimmt danach den ganzen Endpunkt mit. Beide Formen muessen hier leer werden.
-    """
-    return ((cfg.get("frigate") or {}).get("url") or "").rstrip("/")
-
-
-def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path) -> FastAPI:
+def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path,
+              storage_guard=None) -> FastAPI:
     app = FastAPI(title="FaceID")
 
     # Optionales HTTP Basic Auth (config: faceid.auth.user/password). Als Middleware,
@@ -79,6 +71,31 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
     def delete_person(slug: str):
         gallery.delete_person(slug)
         return {"ok": True}
+
+    class PersonMoveBody(BaseModel):
+        source: str
+        target: str
+
+    @app.post("/api/persons/merge")
+    def merge_persons(body: PersonMoveBody):
+        try:
+            moved = gallery.merge_persons(body.target, body.source)
+        except KeyError:
+            raise HTTPException(404, "unknown person")
+        return {"ok": True, "moved": moved, "target": body.target}
+
+    class SplitBody(BaseModel):
+        person: str
+        ids: list[str]
+        name: str
+
+    @app.post("/api/persons/split")
+    def split_person(body: SplitBody):
+        try:
+            slug, moved = gallery.split_person(body.person, body.ids, body.name)
+        except KeyError:
+            raise HTTPException(404, "unknown person")
+        return {"ok": True, "slug": slug, "moved": moved}
 
     # ---------- Identify (read-only, multi-face) ----------
     # Pure recogniser: detect every face in the upload, score each one against the
@@ -444,13 +461,12 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
     @app.get("/api/unknowns")
     def unknowns():
         clusters = gallery.unknown_clusters(eps=float(cfg["faceid"].get("cluster_eps", 0.45)))
-        frigate_url = _frigate_url(cfg)
+        frigate_url = cfg["frigate"]["url"].rstrip("/")
         for c in clusters:
             for u in c:
-                if u.pop("has_full", False):
-                    u["full_url"] = f"data/unknowns/{u['id']}_full.jpg"
-                elif frigate_url and u.get("event_id"):
-                    # Backfill-Bestand: Vollbild live aus Frigate (solange Event-Retention reicht)
+                # Full camera frames are never persisted; retain only a live
+                # source reference when the event API is explicitly available.
+                if u.get("event_id"):
                     u["full_url"] = f"{frigate_url}/api/events/{u['event_id']}/snapshot.jpg"
         return JSONResponse(clusters)
 
@@ -471,7 +487,7 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             if gallery.assign_unknown(uid, slug):
                 n += 1
                 # Zuordnung ans Original-Event zurückspielen (Mensch bestätigt -> Score 1.0)
-                if getattr(processor.frigate, "enabled", True) and meta.get("event_id"):
+                if meta.get("event_id"):
                     processor.frigate.set_sub_label(meta["event_id"], name, 1.0)
         gallery.refresh_guesses()
         return {"assigned": n, "slug": slug}
@@ -485,7 +501,7 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             slug, name, score = gallery.match(it["embedding"])
             if slug and score >= thr and gallery.assign_unknown(it["id"], slug):
                 assigned[name] = assigned.get(name, 0) + 1
-                if getattr(processor.frigate, "enabled", True) and it.get("event_id"):
+                if it.get("event_id"):
                     processor.frigate.set_sub_label(it["event_id"], name, score)
         gallery.refresh_guesses()
         return {"assigned": assigned, "total": sum(assigned.values())}
@@ -547,14 +563,7 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
     # denselben Zustand schreiben. Die Sperre haelt nur den Check-and-Set, nie den Lauf.
     job_lock = threading.Lock()
 
-    folder_input = getattr(processor, "folder_ingest", None)
-    folder_mode = bool(folder_input and folder_input.enabled)
-    # Welcher Zweig laeuft, darf nicht allein an folder_mode haengen: wer Frigate
-    # abschaltet, bevor der Ordner eingerichtet ist, landet sonst im Frigate-Zweig ohne
-    # Frigate — und bekommt einen KeyError statt einer Auskunft.
-    frigate_usable = bool(getattr(processor.frigate, "enabled", True) and _frigate_url(cfg))
-    backfill_state = {"running": False, "processed": 0, "total": 0, "result": None,
-                      "days": 0, "mode": "folder" if folder_mode else "frigate"}
+    backfill_state = {"running": False, "processed": 0, "total": 0, "result": None, "days": 0}
 
     class BackfillBody(BaseModel):
         days: int = 14
@@ -562,37 +571,23 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
     @app.post("/api/backfill")
     def start_backfill(body: BackfillBody):
         days = max(1, min(int(body.days), 60))
-        if not folder_mode and not frigate_usable:
-            raise HTTPException(400, "No input configured — enable Frigate with a URL, "
-                                     "or switch on the recording folder")
         with job_lock:
             if backfill_state["running"]:
                 raise HTTPException(409, "History scan already running")
-            # ``days`` gilt nur fuer den Frigate-Zweig; der Ordner kennt kein Zeitfenster,
-            # sondern nur „schon verarbeitet oder nicht". 0 statt der angefragten Zahl,
-            # damit der Zustand nicht einen Zeitraum behauptet, nach dem niemand gesucht hat.
-            backfill_state.update(running=True, processed=0, total=0, result=None,
-                                  days=0 if folder_mode else days)
+            backfill_state.update(running=True, processed=0, total=0, result=None, days=days)
 
         def progress(i, total):
             backfill_state.update(processed=i, total=total)
 
         def worker():
             try:
-                if folder_mode:
-                    # Derselbe progress-Rueckruf wie im Frigate-Zweig: der Ordnerlauf
-                    # meldet jetzt waehrenddessen, nicht erst danach.
-                    stats = folder_input.scan_once(progress=progress)
-                    backfill_state.update(processed=stats.get("processed", 0),
-                                          total=stats.get("found", 0))
-                else:
-                    from .backfill import run_backfill
-                    stats = run_backfill(
-                        engine, gallery, processor.frigate, _frigate_url(cfg), days=days,
-                        tag=bool(cfg["faceid"].get("set_sub_label", True)),
-                        match_thr=float(cfg["faceid"].get("match_threshold", 0.5)),
-                        progress=progress,
-                        hires=bool(cfg["faceid"].get("hires_enroll", True)))
+                from .backfill import run_backfill
+                stats = run_backfill(
+                    engine, gallery, processor.frigate, cfg["frigate"]["url"], days=days,
+                    tag=bool(cfg["faceid"].get("set_sub_label", True)),
+                    match_thr=float(cfg["faceid"].get("match_threshold", 0.5)),
+                    progress=progress,
+                    hires=bool(cfg["faceid"].get("hires_enroll", True)))
                 backfill_state["result"] = stats
             except Exception as e:
                 log.exception("history scan failed")
@@ -619,12 +614,10 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
     BACKUP_SPEC = {"hires_enroll": bool, "clip_fallback": bool, "clip_fallback_cameras": list, "live_hires_fallback": bool, "live_hires_fallback_cameras": list, "live_hires_mode": str, "backup_enabled": bool, "backup_hour": (0, 23), "backup_keep": (1, 90), "backup_dir": str}
     INT_SPEC = {"max_faces_per_person": (5, 100), "trimmed_keep": (0, 100),
                 "match_top_k": (1, 10), "max_ignore_anchors": (0, 200),
-                "min_face_px": (16, 200), "max_attempts": (1, 20),
-                "folder_max_indexed_files": (0, 200_000)}
+                "min_face_px": (16, 200), "max_attempts": (1, 20)}
     settings_file = data_dir / "settings.json"
 
     def _apply_settings(updates: dict):
-        deferred: list[str] = []
         f = cfg["faceid"]
         f.update(updates)
         # in processor/gallery gecachte Werte live nachziehen
@@ -643,17 +636,8 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             gallery.max_ignore_anchors = int(updates["max_ignore_anchors"])
         if "min_face_px" in updates:
             processor.min_face_px = int(updates["min_face_px"])
-            if folder_input is not None:
-                folder_input.min_face_px = int(updates["min_face_px"])
         if "max_attempts" in updates:
             processor.max_attempts = int(updates["max_attempts"])
-        if "folder_max_indexed_files" in updates and folder_input is not None:
-            # Ueber die gesperrte Methode statt an den privaten Feldern: dies laeuft im
-            # HTTP-Thread, waehrend der Poller denselben Zustand schreiben kann.
-            if not folder_input.set_index_cap(int(updates["folder_max_indexed_files"])):
-                # Nicht verschlucken: bei einem selten laufenden Ordner kann es lange
-                # dauern, bis der naechste Lauf die Grenze nachtraegt.
-                deferred.append("index cap applies when the running folder scan finishes")
         if "dedupe_threshold" in updates:
             gallery.dedupe_threshold = float(updates["dedupe_threshold"])
         if "hires_enroll" in updates:
@@ -676,15 +660,14 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             try: overlay = json.loads(settings_file.read_text())
             except (json.JSONDecodeError, OSError): overlay = {}
         overlay.update({k: v for k, v in updates.items() if k in keys})
-        settings_file.write_text(json.dumps(overlay, ensure_ascii=False, indent=1))
-        return trimmed, deferred
+        atomic_write_text_pinned(
+            settings_file, json.dumps(overlay, ensure_ascii=False, indent=1), storage_guard)
+        return trimmed
 
     @app.get("/api/settings")
     def get_settings():
         f = cfg["faceid"]
         return {
-            "input_mode": "folder" if folder_mode else "frigate",
-            "folder": folder_input.status() if folder_mode else None,
             "thresholds": {k: float(f.get(k, {"match_threshold":0.5,"unknown_threshold":0.35,
                 "suggest_threshold":0.40,"cluster_eps":0.55,"ignore_threshold":0.5,"dedupe_threshold":0.65}[k]))
                 for k in SETTINGS_SPEC},
@@ -699,8 +682,6 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             "max_ignore_anchors": int(f.get("max_ignore_anchors", 0)),
             "min_face_px": int(f.get("min_face_px", 48)),
             "max_attempts": int(f.get("max_attempts", 6)),
-            "folder_max_indexed_files": int(f.get("folder_max_indexed_files",
-                                                  getattr(folder_input, "max_indexed_files", 5000))),
             "hires_enroll": bool(f.get("hires_enroll", True)),
             "clip_fallback": bool(f.get("clip_fallback", True)),
             "clip_fallback_cameras": list(f.get("clip_fallback_cameras") or []),
@@ -732,14 +713,14 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             if k in body:
                 try: updates[k] = min(max(int(body[k]), lo), hi)
                 except (TypeError, ValueError): raise HTTPException(400, f"{k} not an int")
-        trimmed, deferred = _apply_settings(updates)
-        return {"ok": True, "applied": updates, "trimmed": trimmed, "deferred": deferred}
+        trimmed = _apply_settings(updates)
+        return {"ok": True, "applied": updates, "trimmed": trimmed}
 
     @app.post("/api/backup/now")
     def backup_now():
         f = cfg["faceid"]
         bdir = _P(f.get("backup_dir") or (data_dir / "backups"))
-        p = write_backup_file(data_dir, bdir)
+        p = write_backup_file(data_dir, bdir, storage_guard)
         prune_backups(bdir, int(f.get("backup_keep", 7)))
         return {"ok": True, "file": str(p)}
 
@@ -867,6 +848,8 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
         """Gespeicherte Backups auflisten — wer FaceID als App betreibt, kommt sonst gar
         nicht an sie heran und sieht auch nicht, ob das Auto-Backup laeuft."""
         bdir = _P(cfg["faceid"].get("backup_dir") or (data_dir / "backups"))
+        if storage_guard is not None:
+            storage_guard(data=bdir)
         out = []
         if bdir.is_dir():
             for f in sorted(bdir.glob("faceid-backup-*.tar.gz"), reverse=True):
@@ -881,6 +864,8 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
     def backup_file(name: str):
         """Ein bestimmtes gespeichertes Backup ausliefern."""
         bdir = _P(cfg["faceid"].get("backup_dir") or (data_dir / "backups"))
+        if storage_guard is not None:
+            storage_guard(data=bdir)
         # Kein Verzeichniswechsel ueber den Namen — nur Dateien aus genau diesem Ordner.
         target = (bdir / Path(name).name)
         if not target.is_file() or not target.name.startswith("faceid-backup-"):
@@ -893,6 +878,8 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
         """Backup einspielen. merge=false (Default) ersetzt persons+ignored komplett;
         merge=true fügt nur fehlende Personen/Anker hinzu (bestehende bleiben)."""
         raw = await file.read()
+        if storage_guard is not None:
+            storage_guard(data=data_dir)
         try:
             tar = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
         except tarfile.TarError:
@@ -907,12 +894,7 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             for sub in ("persons", "ignored"):
                 d = data_dir / sub
                 if d.exists():
-                    for f in d.rglob("*"):
-                        if f.is_file():
-                            f.unlink()
-                    for f in sorted(d.rglob("*"), reverse=True):
-                        if f.is_dir():
-                            f.rmdir()
+                    remove_tree_pinned(d, storage_guard)
         added = 0
         for m in members:
             if not m.isfile():
@@ -920,9 +902,9 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
             target = data_dir / m.name
             if merge and target.exists():
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
+            mkdir_pinned(target.parent, storage_guard)
             with tar.extractfile(m) as src:
-                target.write_bytes(src.read())
+                atomic_write_bytes_pinned(target, src.read(), storage_guard)
             added += 1
         tar.close()
         gallery.reload()
@@ -942,13 +924,10 @@ def build_app(cfg, engine, gallery, processor, data_dir: Path, static_dir: Path)
     def health():
         # "queue" ist die Review-Queue — das ist es, was der Header zeigt. Die interne
         # Verarbeitungs-Warteschlange steht separat unter "processing".
-        folder = getattr(processor, "folder_ingest", None)
         return {"status": "ok", "persons": len(gallery.persons()),
                 "queue": len(list((data_dir / "unknowns").glob("*.json"))),
                 "processing": processor.queue.qsize(),
                 "open_events": len(processor.events),
-                "source": "folder" if folder and folder.enabled else "frigate",
-                "folder": folder.status() if folder and folder.enabled else None,
                 "suggest_threshold": float(cfg["faceid"].get("suggest_threshold", 0.40))}
 
     return app
